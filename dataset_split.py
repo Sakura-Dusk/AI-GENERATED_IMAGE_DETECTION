@@ -21,7 +21,7 @@ from typing import List, Tuple, Dict
 # ============================================================
 #  CONFIGURABLE PARAMETER – change this to switch test generator
 # ============================================================
-TEST_GENERATOR = "BigGAN"   # Options: ADM, BigGAN, Midjourney, VQDM, glide, stable_diffusion_v_1_5, wukong
+TEST_GENERATOR = "ADM"   # Options: ADM, BigGAN, Midjourney, VQDM, glide, stable_diffusion_v_1_5, wukong
 
 # ============================================================
 #  PATHS
