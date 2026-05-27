@@ -28,16 +28,43 @@ from image_preprocess import AIGeneratedImageDataset, IMG_SIZE
 TEST_GENERATOR = DEFAULT_TEST_GEN   # which generator goes to test set
 BATCH_SIZE     = 64
 NUM_EPOCHS     = 10
-LEARNING_RATE  = 1e-3
+LEARNING_RATE  = 5e-4
 WEIGHT_DECAY   = 1e-4
 NUM_WORKERS    = 0          # DataLoader workers (0 = main thread)
 SEED           = 42
 DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
+VAL_FRACTION   = 0.12       # fraction of train samples used for validation
+EARLY_STOP_PATIENCE = 3     # stop if val loss doesn't improve for this many epochs
 
 
 # ============================================================
-#  CNN MODEL
+#  VAL SPLIT HELPER
 # ============================================================
+
+def split_val_from_train(train_samples, val_fraction=VAL_FRACTION, seed=SEED):
+    """Carve out val_fraction per class from train_samples.
+
+    Returns (remaining_train, val) – both lists of sample dicts.
+    Stratified so each class loses the same fraction.
+    """
+    import random as _random
+    rng = _random.Random(seed)
+
+    by_class = {}
+    for s in train_samples:
+        by_class.setdefault(s["label"], []).append(s)
+
+    remaining, val = [], []
+    for samples in by_class.values():
+        shuffled = list(samples)
+        rng.shuffle(shuffled)
+        n_val = max(1, round(len(shuffled) * val_fraction))
+        val.extend(shuffled[:n_val])
+        remaining.extend(shuffled[n_val:])
+
+    rng.shuffle(remaining)
+    rng.shuffle(val)
+    return remaining, val
 
 class FrequencyCNN(nn.Module):
     """CNN for binary classification of log-magnitude spectrum images.
@@ -236,16 +263,23 @@ def main():
     print(f"\nBuilding data split (test generator = {args.test_gen}) ...")
     split = make_split(test_generator=args.test_gen, verbose=True)
 
-    # Step 1: compute normalisation stats from training images only (no cache)
-    stats_ds = AIGeneratedImageDataset(split["train"])
+    # Carve out validation set from training data (stratified per class)
+    train_samples, val_samples = split_val_from_train(split["train"])
+    print(f"  Train after val split : {len(train_samples)}")
+    print(f"  Val                   : {len(val_samples)}")
+
+    # Compute normalisation stats from the reduced training set only
+    stats_ds = AIGeneratedImageDataset(train_samples)
     mean, std = stats_ds.compute_stats()
 
-    # Step 2: build cached datasets using those stats
-    train_ds = AIGeneratedImageDataset(split["train"], mean=mean, std=std, cache=True)
-    test_ds  = AIGeneratedImageDataset(split["test"],  mean=mean, std=std, cache=True)
+    train_ds = AIGeneratedImageDataset(train_samples, mean=mean, std=std, cache=True)
+    val_ds   = AIGeneratedImageDataset(val_samples,   mean=mean, std=std, cache=True)
+    test_ds  = AIGeneratedImageDataset(split["test"], mean=mean, std=std, cache=True)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch,
                               shuffle=True,  num_workers=NUM_WORKERS)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch,
+                              shuffle=False, num_workers=NUM_WORKERS)
     test_loader  = DataLoader(test_ds,  batch_size=args.batch,
                               shuffle=False, num_workers=NUM_WORKERS)
 
@@ -254,14 +288,6 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel parameters: {n_params:,}")
 
-    # ---- Class-balanced loss ----
-    # Training set has ~3× more fake (1) than real (0), so up-weight real.
-    n_real = sum(1 for s in split["train"] if s["label"] == 0)
-    n_fake = sum(1 for s in split["train"] if s["label"] == 1)
-    # pos_weight = torch.tensor([n_real / n_fake], device=args.device)
-    # print(f"  pos_weight (real/fake ratio): {pos_weight.item():.4f}")
-    # criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    # 不要给真假图不同的权重
     criterion = nn.BCEWithLogitsLoss()
 
     optimizer = torch.optim.Adam(model.parameters(),
@@ -271,11 +297,16 @@ def main():
                     optimizer, T_max=args.epochs)
 
     # ---- Training loop ----
-    best_f1 = 0.0
+    best_val_f1   = 0.0
+    best_val_loss = float("inf")
+    no_improve    = 0          # epochs without val-loss improvement
+    best_state    = None
+    best_epoch    = 1
+
     print(f"\n{'Epoch':>5}  {'TrainLoss':>10}  {'TrainAcc':>9}  "
-          f"{'TestLoss':>9}  {'TestAcc':>9}  {'Prec':>6}  "
-          f"{'Recall':>7}  {'F1':>6}  {'AUC':>6}  {'Time':>6}")
-    print("-" * 95)
+          f"{'ValLoss':>8}  {'ValAcc':>7}  {'ValF1':>6}  {'ValAUC':>7}  "
+          f"{'Time':>6}  {'Note':>4}")
+    print("-" * 100)
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -283,43 +314,58 @@ def main():
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, args.device)
 
-        test_metrics = evaluate(model, test_loader, criterion, args.device)
+        val_metrics = evaluate(model, val_loader, criterion, args.device)
 
         scheduler.step()
         elapsed = time.time() - t0
 
+        note = ""
+        if val_metrics["f1"] > best_val_f1:
+            best_val_f1 = val_metrics["f1"]
+            best_epoch  = epoch
+            best_state  = {k: v.cpu().clone() if torch.is_tensor(v) else v
+                           for k, v in model.state_dict().items()}
+            note = "*"
+
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            no_improve = 0
+        else:
+            no_improve += 1
+
         print(f"{epoch:5d}  {train_loss:10.4f}  {train_acc:9.4f}  "
-              f"{test_metrics['loss']:9.4f}  {test_metrics['accuracy']:9.4f}  "
-              f"{test_metrics['precision']:6.4f}  {test_metrics['recall']:7.4f}  "
-              f"{test_metrics['f1']:6.4f}  {test_metrics['auc']:6.4f}  "
-              f"{elapsed:5.1f}s")
+              f"{val_metrics['loss']:8.4f}  {val_metrics['accuracy']:7.4f}  "
+              f"{val_metrics['f1']:6.4f}  {val_metrics['auc']:7.4f}  "
+              f"{elapsed:5.1f}s  {note}")
 
-        # Track best by F1 (more robust than accuracy for imbalanced data)
-        if test_metrics["f1"] > best_f1:
-            best_f1 = test_metrics["f1"]
-            best_epoch = epoch
-            best_metrics = dict(test_metrics)
+        if no_improve >= EARLY_STOP_PATIENCE:
+            print(f"\nEarly stopping: val loss did not improve for "
+                  f"{EARLY_STOP_PATIENCE} consecutive epochs.")
+            break
 
-    # ---- Final summary ----
+    # ---- Evaluate best model on test set ----
+    model.load_state_dict(best_state)
+    test_metrics = evaluate(model, test_loader, criterion, args.device)
+
     print("\n" + "=" * 60)
-    print(f"  Best test epoch  : {best_epoch}")
-    print(f"  Best F1          : {best_f1:.4f}")
-    print(f"  Precision        : {best_metrics['precision']:.4f}")
-    print(f"  Recall           : {best_metrics['recall']:.4f}")
-    print(f"  F1               : {best_metrics['f1']:.4f}")
-    print(f"  AUC              : {best_metrics['auc']:.4f}")
-    print(f"  TP={best_metrics['tp']}  FP={best_metrics['fp']}  "
-          f"TN={best_metrics['tn']}  FN={best_metrics['fn']}")
+    print(f"  Best val epoch   : {best_epoch}")
+    print(f"  Best val F1      : {best_val_f1:.4f}")
+    print(f"  --- Test set (best val checkpoint) ---")
+    print(f"  Precision        : {test_metrics['precision']:.4f}")
+    print(f"  Recall           : {test_metrics['recall']:.4f}")
+    print(f"  F1               : {test_metrics['f1']:.4f}")
+    print(f"  AUC              : {test_metrics['auc']:.4f}")
+    print(f"  TP={test_metrics['tp']}  FP={test_metrics['fp']}  "
+          f"TN={test_metrics['tn']}  FN={test_metrics['fn']}")
     print("=" * 60)
 
     # ---- Save model ----
     save_path = Path(__file__).resolve().parent / f"cnn_{args.test_gen}.pt"
     torch.save({
         "epoch": best_epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "best_f1": best_f1,
-        "best_metrics": best_metrics,
+        "model_state_dict": best_state,
+        "best_val_f1": best_val_f1,
+        "test_metrics": test_metrics,
         "test_generator": args.test_gen,
         "norm_mean": mean,
         "norm_std": std,

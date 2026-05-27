@@ -1,0 +1,47 @@
+Device: cpu
+
+Building data split (test generator = ADM) ...
+============================================================
+  Test generator : ADM
+  Train - real   : 5182
+  Train - fake   : 15000  (from: BigGAN, Midjourney, VQDM, glide, stable_diffusion_v_1_5, wukong)
+  Train - total  : 20182
+  Test  - real   : 646
+  Test  - fake   : 2500  (from: ADM)
+  Test  - total  : 3146
+============================================================
+  Train after val split : 17760
+  Val                   : 2422
+  Computing normalisation stats from 17760 images ... 1000 2000 3000 4000 5000 6000 7000 8000 9000 10000 11000 12000 13000 14000 15000 16000 17000 done  mean=6.9895  std=1.4665
+  Pre-computing DFT features for 17760 images ... 500 1000 1500 2000 2500 3000 3500 4000 4500 5000 5500 6000 6500 7000 7500 8000 8500 9000 9500 10000 10500 11000 11500 12000 12500 13000 13500 14000 14500 15000 15500 16000 16500 17000 17500 done (17760/17760)
+  Pre-computing DFT features for 2422 images ... 500 1000 1500 2000 done (2422/2422)
+  Pre-computing DFT features for 3146 images ... 500 1000 1500 2000 2500 3000 done (3146/3146)
+
+Model parameters: 1,437,409
+
+Epoch   TrainLoss   TrainAcc   ValLoss   ValAcc   ValF1   ValAUC    Time  Note
+----------------------------------------------------------------------------------------------------
+    1      0.4709     0.7512    0.4284   0.7931  0.8700   0.8391  528.4s  *
+    2      0.4342     0.7765    0.4414   0.7655  0.8291   0.8497  576.1s  
+    3      0.4201     0.7829    0.4502   0.7597  0.8218   0.8509  547.2s  
+    4      0.4077     0.7980    0.4256   0.7675  0.8285   0.8709  469.2s  
+    5      0.3974     0.8085    0.3867   0.8130  0.8739   0.8747  518.2s  *
+    6      0.3796     0.8221    0.3628   0.8315  0.8921   0.8851  616.2s  *
+    7      0.3670     0.8276    0.3485   0.8369  0.8933   0.8919  678.2s  *
+    8      0.3503     0.8384    0.3552   0.8270  0.8849   0.8898  601.5s  
+    9      0.3405     0.8467    0.3408   0.8373  0.8915   0.8994  476.7s  
+   10      0.3347     0.8486    0.3355   0.8406  0.8963   0.9015  640.6s  *
+
+============================================================
+  Best val epoch   : 10
+  Best val F1      : 0.8963
+  --- Test set (best val checkpoint) ---
+  Precision        : 0.8435
+  Recall           : 0.5108
+  F1               : 0.6363
+  AUC              : 0.5836
+  TP=1277  FP=237  TN=409  FN=1223
+============================================================
+
+Model saved to /home/sakura/AI-Generated_Image_Detection/cnn_ADM.pt
+python train.py --epochs 10  53483.77s user 11949.96s system 1118% cpu 1:37:27.55 total
