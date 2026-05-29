@@ -114,22 +114,20 @@ def _transposed_conv_artifact(img: Image.Image, scale: int = 2) -> Image.Image:
     # Step 2: zero-insert (stride-scale expansion)
     # Allocate a zero tensor of original size and fill every `scale`-th pixel
     t_expanded = torch.zeros(1, 3, H, W)
-    t_expanded[:, :, ::scale, ::scale] = t_small[:, :, :H // scale, :W // scale]
+    sh, sw = t_small.shape[-2], t_small.shape[-1]
+    t_expanded[:, :, :sh * scale:scale, :sw * scale:scale] = t_small
 
     # Step 3: smooth with Gaussian kernel (mimics the conv kernel)
     sigma = 0.5 * scale
-    ks = 2 * (int(3 * sigma) | 1) - 1  # odd kernel size
-    ks = max(3, ks)
-    # Build separable Gaussian kernel
-    ax = torch.arange(ks, dtype=torch.float32) - ks // 2
+    r = max(1, int(3 * sigma))   # half-width; ks = 2r+1 is always odd
+    ks = 2 * r + 1
+    ax = torch.arange(ks, dtype=torch.float32) - r
     gauss1d = torch.exp(-ax ** 2 / (2 * sigma ** 2))
     gauss1d /= gauss1d.sum()
     kernel_2d = torch.outer(gauss1d, gauss1d).unsqueeze(0).unsqueeze(0)
     kernel_2d = kernel_2d.repeat(3, 1, 1, 1)  # depthwise
 
-    pad = ks // 2
-    blurred = F.conv2d(t_expanded, kernel_2d, padding=pad, groups=3)
-    blurred = blurred[:, :, :H, :W]  # safety crop
+    blurred = F.conv2d(t_expanded, kernel_2d, padding=r, groups=3)
 
     return _to_pil(blurred)
 

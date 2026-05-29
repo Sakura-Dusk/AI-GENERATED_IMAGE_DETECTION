@@ -50,8 +50,11 @@ GENERATOR_DIRS = ["ADM", "BigGAN", "Midjourney", "VQDM",
 #  DATA SPLIT
 # ============================================================
 
+ALL_SIM_MODES = ["nearest", "bilinear", "bicubic", "transposed", "jpeg"]
+
+
 def make_autogan_split(
-    sim_mode: str = "nearest",
+    sim_mode: str = "random",
     sim_scale: int = 2,
     val_fraction: float = VAL_FRACTION,
     seed: int = SEED,
@@ -65,6 +68,9 @@ def make_autogan_split(
     Each sample dict keys: path, label, source, sim_mode, sim_scale.
       sim_mode=None  → load directly (real image or real-generator fake)
       sim_mode=str   → load path, apply simulate_image(), then DFT
+
+    When sim_mode="random", each simulated fake image independently draws
+    one of the five simulation modes at random (seeded for reproducibility).
     """
     meta = parse_nature_metadata(META_CSV)
 
@@ -85,14 +91,18 @@ def make_autogan_split(
     nature_val   = nature_trainval[:n_val]
     nature_train = nature_trainval[n_val:]
 
+    def _pick_mode() -> str:
+        return rng.choice(ALL_SIM_MODES) if sim_mode == "random" else sim_mode
+
     def _pair(paths: List[str]) -> List[Dict]:
         samples = []
         for p in paths:
             samples.append({"path": p, "label": 0, "source": "Nature",
                              "sim_mode": None, "sim_scale": None})
+            chosen = _pick_mode()
             samples.append({"path": p, "label": 1,
-                             "source": f"simulated_{sim_mode}",
-                             "sim_mode": sim_mode, "sim_scale": sim_scale})
+                             "source": f"simulated_{chosen}",
+                             "sim_mode": chosen, "sim_scale": sim_scale})
         return samples
 
     train_samples = _pair(nature_train)
@@ -121,8 +131,15 @@ def make_autogan_split(
         n_va_fake = sum(1 for s in val_samples   if s["label"] == 1)
         n_te_real = sum(1 for s in test_samples  if s["label"] == 0)
         n_te_fake = sum(1 for s in test_samples  if s["label"] == 1)
+        mode_label = "random (uniform over 5 modes)" if sim_mode == "random" else sim_mode
         print("=" * 60)
-        print(f"  Simulation mode : {sim_mode}  scale={sim_scale}")
+        print(f"  Simulation mode : {mode_label}  scale={sim_scale}")
+        if sim_mode == "random":
+            from collections import Counter
+            mode_counts = Counter(
+                s["sim_mode"] for s in train_samples if s["sim_mode"] is not None
+            )
+            print(f"  Train mode dist : { {k: mode_counts[k] for k in ALL_SIM_MODES if k in mode_counts} }")
         print(f"  Train  real={n_tr_real}  fake={n_tr_fake}  total={len(train_samples)}")
         print(f"  Val    real={n_va_real}  fake={n_va_fake}  total={len(val_samples)}")
         print(f"  Test   real={n_te_real}  fake={n_te_fake}  total={len(test_samples)}")
@@ -361,8 +378,8 @@ def _print_results(results: Dict) -> None:
 def main():
     parser = argparse.ArgumentParser(
         description="Train FrequencyCNN with AutoGAN-simulated fakes")
-    parser.add_argument("--sim_mode",  type=str,   default="nearest",
-                        choices=["nearest", "bilinear", "bicubic",
+    parser.add_argument("--sim_mode",  type=str,   default="random",
+                        choices=["random", "nearest", "bilinear", "bicubic",
                                  "transposed", "jpeg"])
     parser.add_argument("--sim_scale", type=int,   default=2)
     parser.add_argument("--epochs",    type=int,   default=NUM_EPOCHS)
