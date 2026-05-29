@@ -50,7 +50,7 @@ GENERATOR_DIRS = ["ADM", "BigGAN", "Midjourney", "VQDM",
 #  DATA SPLIT
 # ============================================================
 
-ALL_SIM_MODES = ["nearest", "bilinear", "bicubic", "transposed", "jpeg"]
+ALL_SIM_MODES = ["nearest", "bilinear", "bicubic"]
 
 
 def make_autogan_split(
