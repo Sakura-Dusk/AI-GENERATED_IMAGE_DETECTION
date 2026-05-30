@@ -131,7 +131,8 @@ def make_autogan_split(
         n_va_fake = sum(1 for s in val_samples   if s["label"] == 1)
         n_te_real = sum(1 for s in test_samples  if s["label"] == 0)
         n_te_fake = sum(1 for s in test_samples  if s["label"] == 1)
-        mode_label = "random (uniform over 5 modes)" if sim_mode == "random" else sim_mode
+        mode_label = (f"random (uniform over {len(ALL_SIM_MODES)} modes)"
+                      if sim_mode == "random" else sim_mode)
         print("=" * 60)
         print(f"  Simulation mode : {mode_label}  scale={sim_scale}")
         if sim_mode == "random":
@@ -371,6 +372,70 @@ def _print_results(results: Dict) -> None:
     print(_row("ALL (overall)", results["overall"]))
     print(sep + "\n")
 
+
+@torch.no_grad()
+def evaluate_val_per_mode(
+    model: nn.Module,
+    val_samples: List[Dict],
+    device: str,
+    batch_size: int = 64,
+    mean: Optional[float] = None,
+    std: Optional[float] = None,
+    img_size: int = IMG_SIZE,
+) -> Dict:
+    """Evaluate validation set grouped by simulation mode.
+
+    Validation set contains Nature real images + simulated fakes of various
+    modes.  For each mode we pair all Nature real images with that mode's
+    fake images and compute metrics independently.  Returns:
+      worst_f1 : minimum F1 across the three modes
+      per_mode : {mode_prefix: metrics_dict}
+    """
+    model.eval()
+    all_probs:   List[float] = []
+    all_labels:  List[int]   = []
+    all_sources: List[str]   = []
+
+    for start in range(0, len(val_samples), batch_size):
+        batch = val_samples[start: start + batch_size]
+        tensors = [preprocess_to_tensor(s["path"], img_size, mean=mean, std=std)
+                   for s in batch]
+        inputs = torch.stack(tensors).to(device)
+        logits = model(inputs)
+        probs  = torch.sigmoid(logits).cpu().tolist()
+        for s, p in zip(batch, probs):
+            all_probs.append(p)
+            all_labels.append(s["label"])
+            all_sources.append(s["source"])
+
+    probs_arr  = np.array(all_probs,  dtype=np.float32)
+    labels_arr = np.array(all_labels, dtype=np.int64)
+
+    nature_mask = np.array([s == "Nature" for s in all_sources])
+    nat_probs   = probs_arr[nature_mask]
+    nat_labels  = labels_arr[nature_mask]
+
+    sim_prefixes = ["simulated_nearest", "simulated_bilinear",
+                    "simulated_bicubic"]
+    per_mode: Dict[str, Dict] = {}
+    f1s: List[float] = []
+
+    for prefix in sim_prefixes:
+        mode_mask   = np.array([s == prefix for s in all_sources])
+        mode_probs  = probs_arr[mode_mask]
+        mode_labels = labels_arr[mode_mask]
+        if len(mode_probs) == 0:
+            continue
+        combined_probs  = np.concatenate([nat_probs,  mode_probs])
+        combined_labels = np.concatenate([nat_labels, mode_labels])
+        m = _compute_metrics(combined_probs, combined_labels)
+        per_mode[prefix] = m
+        f1s.append(m["f1"])
+
+    worst_f1 = min(f1s) if f1s else 0.0
+    return {"worst_f1": worst_f1, "per_mode": per_mode}
+
+
 # ============================================================
 #  MAIN
 # ============================================================
@@ -425,7 +490,7 @@ def main():
     print(f"Model parameters : {n_params:,}\n")
 
     # ---- Training loop ----
-    best_val_f1   = 0.0
+    best_worst_f1 = 0.0
     best_val_loss = float("inf")
     no_improve    = 0
     best_state    = None
@@ -436,23 +501,29 @@ def main():
 
     print(f"{'Epoch':>5}  {'TrainLoss':>10}  {'TrainAcc':>9}  "
           f"{'ValLoss':>8}  {'ValAcc':>7}  {'ValF1':>6}  {'ValAUC':>7}  "
+          f"{'WorstF1':>7}  {'NearF1':>7}  {'BiliF1':>7}  {'BicuF1':>7}  "
           f"{'Time':>6}  {'Note':>4}")
-    print("-" * 82)
+    print("-" * 112)
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, args.device)
         val_metrics = _evaluate(model, val_loader, criterion, args.device)
+        val_mode = evaluate_val_per_mode(
+            model, split["val"], device=args.device,
+            batch_size=args.batch, mean=mean, std=std,
+        )
         scheduler.step()
         elapsed = time.time() - t0
 
+        worst_f1 = val_mode["worst_f1"]
         note = ""
-        if val_metrics["f1"] > best_val_f1:
-            best_val_f1 = val_metrics["f1"]
-            best_epoch  = epoch
-            best_state  = {k: v.cpu().clone() if torch.is_tensor(v) else v
-                           for k, v in model.state_dict().items()}
+        if worst_f1 > best_worst_f1:
+            best_worst_f1 = worst_f1
+            best_epoch    = epoch
+            best_state    = {k: v.cpu().clone() if torch.is_tensor(v) else v
+                             for k, v in model.state_dict().items()}
             note = "*"
 
         if val_metrics["loss"] < best_val_loss:
@@ -461,9 +532,14 @@ def main():
         else:
             no_improve += 1
 
+        near_f1 = val_mode["per_mode"].get("simulated_nearest", {}).get("f1", 0.0)
+        bili_f1 = val_mode["per_mode"].get("simulated_bilinear", {}).get("f1", 0.0)
+        bicu_f1 = val_mode["per_mode"].get("simulated_bicubic",  {}).get("f1", 0.0)
+
         print(f"{epoch:5d}  {train_loss:10.4f}  {train_acc:9.4f}  "
               f"{val_metrics['loss']:8.4f}  {val_metrics['accuracy']:7.4f}  "
               f"{val_metrics['f1']:6.4f}  {val_metrics['auc']:7.4f}  "
+              f"{worst_f1:7.4f}  {near_f1:7.4f}  {bili_f1:7.4f}  {bicu_f1:7.4f}  "
               f"{elapsed:5.1f}s  {note}")
 
         if no_improve >= EARLY_STOP_PATIENCE:
@@ -472,7 +548,8 @@ def main():
             break
 
     # ---- Test: per-source evaluation ----
-    print(f"\nBest checkpoint: epoch {best_epoch}  val_F1={best_val_f1:.4f}")
+    print(f"\nBest checkpoint: epoch {best_epoch}  "
+          f"val_worst_F1={best_worst_f1:.4f}")
     model.load_state_dict(best_state)
 
     results = evaluate_per_source(
@@ -486,7 +563,7 @@ def main():
     torch.save({
         "epoch":            best_epoch,
         "model_state_dict": best_state,
-        "best_val_f1":      best_val_f1,
+        "best_worst_f1":    best_worst_f1,
         "test_results":     results,
         "sim_mode":         args.sim_mode,
         "sim_scale":        args.sim_scale,
