@@ -2,3 +2,8 @@ dataset
 __pycache__
 
 .qoder
+
+mini_paper_form.pdf
+mini_paper.md
+
+.gitignore

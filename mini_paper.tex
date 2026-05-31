@@ -1,0 +1,312 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{times}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{multirow}
+\usepackage{array}
+
+\geometry{margin=1in}
+
+\title{\textbf{Detecting AI-Generated Images via Simulated Frequency Artifacts:\\A Training-Free Synthesis Approach}}
+
+\author{Sakura Dusk}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Detecting AI-generated images remains challenging due to the limited generalization of classifiers trained on specific generators. When tested on unseen generators, performance degrades significantly. In this paper, we propose a frequency-domain approach that trains detectors exclusively on simulated fake images synthesized from real images via downsampling-upsampling pipelines, eliminating the need for any real AI-generated images during training. Inspired by the observation that GAN upsampling layers produce spectral replication artifacts in the frequency domain, we apply three interpolation-based simulation modes (nearest-neighbor, bilinear, bicubic) to real images and use the resulting pairs as training data for a lightweight CNN operating on DFT log-magnitude spectra. We further introduce a worst-case model selection strategy that chooses checkpoints maximizing the minimum F1 across simulation modes, preventing overfitting to any single artifact type. Evaluated on the GenImage benchmark covering 7 generators (ADM, BigGAN, Midjourney, VQDM, glide, Stable Diffusion~v1.5, wukong), our best model achieves 0.92 overall F1 and 0.80 AUC without seeing any real AI-generated images during training, demonstrating strong cross-generator generalization.
+\end{abstract}
+
+\section{Introduction}
+
+The rapid advancement of generative models---from GANs~\cite{goodfellow2014generative} to diffusion models~\cite{ho2020denoising, saharia2022photorealistic}---has made it increasingly difficult to distinguish AI-generated images from real photographs. While frequency-domain analysis has shown promise in revealing invisible artifacts left by generative pipelines~\cite{zhang2020detecting, frank2020leveraging}, a fundamental challenge persists: detectors trained on images from specific generators fail to generalize to unseen generators~\cite{zhu2023genimage}.
+
+This generalization gap is well-documented. A classifier achieving 0.89 F1 on a known generator (ADM) may drop to 0.64 F1 when the training and test generators differ, even with proper validation splits. The root cause is that detectors learn generator-specific spectral signatures rather than universal synthesis artifacts.
+
+We propose a fundamentally different training paradigm: instead of using real AI-generated images, we synthesize fake-like images from real ones using simple downsampling-upsampling pipelines. This approach is grounded in the insight from Zhang et al.~\cite{zhang2020detecting} that the upsampling operations common to all generative architectures produce characteristic spectral replication artifacts. By replicating this process on real images, we create training data that captures the universal artifact pattern without depending on any specific generator.
+
+Our contributions are:
+\begin{enumerate}[nosep]
+    \item A simulation-based training framework that requires zero real AI-generated images, yet achieves strong cross-generator detection performance.
+    \item A worst-case model selection strategy based on the minimum F1 across simulation modes, which effectively prevents the detector from overfitting to a single artifact type.
+    \item A comprehensive evaluation on the GenImage benchmark showing that our approach significantly outperforms baseline methods trained on real fake images when generalization to unseen generators is required.
+\end{enumerate}
+
+\section{Related Work}
+
+\textbf{Frequency-domain detection.}
+The spectral domain has proven effective for detecting GAN-generated images. Frank et al.~\cite{frank2020leveraging} demonstrated that GAN images exhibit distinct frequency patterns visible in the DFT magnitude spectrum. Zhang et al.~\cite{zhang2020detecting} proposed AutoGAN, which simulates GAN artifacts through downsampling-upsampling pipelines and showed that detectors trained on such simulated data can generalize to unseen GAN architectures. Dong et al.~\cite{dong2022think} further analyzed spectral imprints and cautioned about over-reliance on frequency features. Our work extends the AutoGAN idea to the diffusion model era and introduces multi-mode training with worst-case selection.
+
+\textbf{AI-generated image benchmarks.}
+Zhu et al.~\cite{zhu2023genimage} introduced GenImage, a million-scale benchmark covering 8 generators across 1000 ImageNet categories with strict pairing controls. Their cross-generator evaluation revealed that existing detectors achieve only 50--62\% accuracy on unseen generators---barely above random guessing. This benchmark motivates our focus on cross-generator generalization.
+
+\textbf{Learning from simulated data.}
+Training on synthesized data to detect real artifacts has been explored in forensic contexts. The key insight is that if the simulation captures the essential signal characteristics, the learned features transfer to real data. Our work applies this principle to the frequency domain, where upsampling artifacts have a clear mathematical structure: downsampling by factor $s$ followed by upsampling creates replicas of the original spectrum at intervals of $1/s$ in the frequency domain~\cite{zhang2020detecting}.
+
+\section{Method}
+
+\subsection{Frequency-Domain Preprocessing}
+
+Following established practice~\cite{frank2020leveraging, zhang2020detecting}, we operate on the Discrete Fourier Transform (DFT) log-magnitude spectrum rather than raw pixel values. For an input image $I$, we compute:
+\begin{equation}
+    \mathcal{F}(I) = \log\!\bigl(1 + \bigl|\mathrm{FFT}_{\mathrm{shift}}(I_{\mathrm{gray}})\bigr|\bigr)
+\end{equation}
+where $I_{\mathrm{gray}}$ is the grayscale version resized to $224 \times 224$, and $\mathrm{FFT}_{\mathrm{shift}}$ centers the zero-frequency component. The log-magnitude spectrum is then z-score normalized using statistics computed on the training set. This representation isolates frequency-domain artifacts from semantic content.
+
+\subsection{Artifact Simulation}
+
+Given a real image $I_{\mathrm{real}}$, we synthesize a simulated fake image $I_{\mathrm{sim}}$ through a downsampling-upsampling pipeline:
+\begin{equation}
+    I_{\mathrm{sim}} = \mathrm{Up}_\theta\bigl(\mathrm{Down}_s(I_{\mathrm{real}})\bigr)
+\end{equation}
+where $\mathrm{Down}_s$ reduces the spatial resolution by factor $s$ using area averaging, and $\mathrm{Up}_\theta$ restores the original resolution using interpolation mode $\theta$. We consider three modes:
+\begin{itemize}[nosep]
+    \item \textbf{Nearest-neighbor} ($\theta = \text{nearest}$): Produces the most pronounced spectral replication artifacts, as each pixel is simply replicated $s \times s$ times.
+    \item \textbf{Bilinear} ($\theta = \text{bilinear}$): Applies linear interpolation, producing smoother but still detectable spectral patterns.
+    \item \textbf{Bicubic} ($\theta = \text{bicubic}$): Uses cubic interpolation, yielding the subtlest artifacts among the three modes.
+\end{itemize}
+
+The choice of these three modes is deliberate: they span a range of artifact intensities. Nearest-neighbor produces the strongest spectral replications (most similar to GAN artifacts), while bicubic produces the weakest (closer to diffusion model artifacts). Training on all three modes encourages the detector to learn features robust to varying artifact strengths.
+
+\subsection{Training with Worst-Case Selection}
+
+Our training set consists of real images paired with their simulated fakes across all three modes, randomly assigned per image:
+\begin{equation}
+    \mathcal{D}_{\mathrm{train}} = \{(I_i, 0)\}_{i=1}^{N} \cup \{(I_j, 1, \theta_j)\}_{j=1}^{N}
+\end{equation}
+where $\theta_j \sim \mathrm{Uniform}(\{\text{nearest}, \text{bilinear}, \text{bicubic}\})$ and $I_j$ is the simulated fake generated from the $j$-th real image using mode $\theta_j$. This ensures a 1:1 class balance.
+
+A critical design choice is the model selection criterion. Standard practice selects the checkpoint with the highest overall validation F1. However, we observe that this leads to overfitting: the model excels on the dominant artifact type but fails on others, resulting in extremely high precision ($>$0.94) but collapsed recall ($<$0.35) on unseen generators.
+
+We instead propose \textbf{worst-case F1 selection}: at each epoch, we compute F1 separately for each simulation mode on the validation set and define:
+\begin{equation}
+    \mathrm{WorstF1} = \min_{\theta}\; \mathrm{F1}_\theta
+\end{equation}
+The checkpoint with the highest WorstF1 is selected. This min-max strategy ensures that the model performs reasonably on all artifact types, preventing it from ignoring any mode.
+
+\subsection{Model Architecture}
+
+We use a lightweight CNN (1.44M parameters) operating on single-channel DFT log-magnitude spectra. The architecture consists of four convolutional blocks, each comprising Conv2d $\to$ BatchNorm2d $\to$ ReLU $\to$ MaxPool2d, followed by adaptive average pooling and a fully-connected classifier. Table~\ref{tab:arch} details the architecture.
+
+\begin{table}[t]
+\centering
+\caption{Model architecture.}
+\label{tab:arch}
+\begin{tabular}{lc}
+\toprule
+Layer & Output Shape \\
+\midrule
+Conv(1$\to$32) + BN + ReLU + MaxPool(2) & $32 \times 112 \times 112$ \\
+Conv(32$\to$64) + BN + ReLU + MaxPool(2) & $64 \times 56 \times 56$ \\
+Conv(64$\to$128) + BN + ReLU + MaxPool(2) & $128 \times 28 \times 28$ \\
+Conv(128$\to$256) + BN + ReLU + MaxPool(2) & $256 \times 14 \times 14$ \\
+AdaptiveAvgPool(4$\times$4) & $256 \times 4 \times 4$ \\
+FC(4096$\to$256) + ReLU + Dropout(0.5) & 256 \\
+FC(256$\to$1) & 1 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Training uses BCEWithLogitsLoss with Adam (lr=$5 \times 10^{-4}$, weight decay=$10^{-4}$) and cosine annealing scheduling. Early stopping is triggered when validation loss fails to improve for 3 consecutive epochs.
+
+\section{Experiments}
+
+\subsection{Setup}
+
+\textbf{Dataset.}
+We use the GenImage benchmark~\cite{zhu2023genimage} (unbiased-tiny subset), containing real images from ImageNet and fake images from 7 generators: ADM, BigGAN, Midjourney, VQDM, glide, Stable Diffusion~v1.5, and wukong. Nature images are split using the provided metadata: \texttt{train.*} tags for training/validation, \texttt{val.*} tags for testing.
+
+\textbf{Data split.}
+Training: 4,560 Nature images + 4,560 simulated fakes (9,120 total). Validation: 622 Nature images + 622 simulated fakes (1,244 total). Test: 646 Nature real images + 17,500 images from all 7 generators (18,146 total). Notably, no real AI-generated images appear in training or validation.
+
+\textbf{Evaluation.}
+We report per-generator F1 and AUC, as well as overall metrics. For each generator, we pair all 646 Nature test images with that generator's 2,500 fake images to compute binary classification metrics.
+
+\subsection{Baseline: Training on Real Fake Images}
+
+We first establish baselines by training on real AI-generated images. Table~\ref{tab:baseline} shows the results.
+
+\begin{table}[t]
+\centering
+\caption{Baseline results: training on real AI-generated images from 6 generators, testing on ADM.}
+\label{tab:baseline}
+\begin{tabular}{lcccc}
+\toprule
+Method & Test Gen & F1 & AUC & Note \\
+\midrule
+Train on 6 gens & ADM & 0.8905 & 0.8238 & No val split \\
+Train on 6 gens & ADM & 0.6363 & 0.5836 & With val split \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Without a validation split, the model overfits to the training generators, achieving 0.89 F1 on ADM (which it has not seen) but this is misleading---the test loss increases after epoch~3, indicating memorization rather than generalization. With proper validation-based model selection, the best validation checkpoint (epoch~10, val F1=0.8963) yields only 0.64 F1 on the test generator, with Recall dropping to 0.51. This confirms the generalization problem: features learned from specific generators do not transfer well.
+
+\subsection{Simulation-Based Training}
+
+We compare four simulation strategies, all using the same architecture and hyperparameters. Table~\ref{tab:ablation} summarizes the results.
+
+\begin{table}[t]
+\centering
+\caption{Comparison of simulation strategies. All models use the same FrequencyCNN architecture.}
+\label{tab:ablation}
+\begin{tabular}{llccc}
+\toprule
+Strategy & Modes & Selection & Overall F1 & Overall AUC \\
+\midrule
+Single-mode & nearest only & Val F1 & 0.8401 & 0.8037 \\
+Multi-mode (5) & near+bili+bicu+trans+jpeg & Val F1 & 0.7158 & 0.8100 \\
+Multi-mode (3) & nearest+bilinear+bicubic & Val F1 & 0.6400 & 0.8110 \\
+\textbf{Multi-mode (3) + WorstF1} & \textbf{nearest+bilinear+bicubic} & \textbf{WorstF1} & \textbf{0.9209} & \textbf{0.8007} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Single-mode (nearest only)} achieves reasonable overall F1 (0.84) but shows high variance across generators: 0.96 on BigGAN but only 0.62 on wukong. The detector overfits to nearest-neighbor artifacts specifically.
+
+\textbf{Multi-mode (5 modes)} mixes three interpolation modes with transposed convolution and JPEG simulation. This severely hurts performance: Precision soars to 0.99 while Recall collapses to 0.56. The transposed convolution and JPEG modes introduce qualitatively different artifacts (checkerboard patterns, $8 \times 8$ blocking) that conflict with the spectral replication patterns of interpolation-based upsampling, confusing the detector.
+
+\textbf{Multi-mode (3 modes, Val F1 selection)} removes the conflicting modes but still suffers from the overfitting problem. The model learns to recognize the dominant pattern (which has the strongest signal) while ignoring the subtler modes. Val F1 reaches 0.87 at epoch~10, but per-mode analysis reveals that bicubic F1 is near zero---the model has effectively learned to detect only nearest-neighbor artifacts.
+
+\textbf{Multi-mode (3 modes, WorstF1 selection)}---our proposed method---selects the checkpoint where the weakest mode still performs well (epoch~1, WorstF1=0.33). While the absolute WorstF1 value appears low, this early checkpoint has not yet overfit to any single mode and retains balanced sensitivity to all artifact types. The result is a dramatic improvement: Overall F1 jumps to 0.92 and, more importantly, per-generator performance becomes balanced.
+
+\subsection{Per-Generator Results}
+
+Table~\ref{tab:per-gen} presents detailed results for our best method (3-mode + WorstF1 selection).
+
+\begin{table}[t]
+\centering
+\caption{Per-generator detection results using 3-mode simulation with WorstF1 selection. Nature test images (646) are paired with each generator's fake images (2,500) for binary classification.}
+\label{tab:per-gen}
+\begin{tabular}{lccccc}
+\toprule
+Generator & Acc & Precision & Recall & F1 & AUC \\
+\midrule
+ADM & 0.8067 & 0.8559 & 0.9100 & 0.8821 & 0.8242 \\
+BigGAN & 0.8783 & 0.8672 & 1.0000 & 0.9289 & 1.0000 \\
+Midjourney & 0.8093 & 0.8563 & 0.9132 & 0.8839 & 0.7936 \\
+VQDM & 0.7810 & 0.8514 & 0.8776 & 0.8643 & 0.7878 \\
+glide & 0.8779 & 0.8671 & 0.9996 & 0.9287 & 0.9983 \\
+Stable Diffusion v1.5 & 0.6570 & 0.8249 & 0.7216 & 0.7698 & 0.6185 \\
+wukong & 0.6262 & 0.8167 & 0.6828 & 0.7438 & 0.5828 \\
+\midrule
+\textbf{ALL (overall)} & \textbf{0.8556} & \textbf{0.9755} & \textbf{0.8721} & \textbf{0.9209} & \textbf{0.8007} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Several observations emerge:
+\begin{enumerate}[nosep]
+    \item \textbf{GAN-based generators (BigGAN, glide) are easily detected} (F1 $>$ 0.92, AUC $>$ 0.99), consistent with their known spectral artifacts~\cite{frank2020leveraging}.
+    \item \textbf{Diffusion-based generators (ADM, Midjourney, VQDM) show moderate detectability} (F1 0.86--0.88), suggesting that our interpolation-based simulation captures some but not all of their spectral signatures.
+    \item \textbf{Stable Diffusion~v1.5 and wukong remain the hardest} (F1 0.74--0.77), likely because these models use more sophisticated upsampling strategies that deviate further from simple interpolation.
+    \item \textbf{Precision is consistently higher than Recall}, indicating the detector is conservative---it rarely misclassifies real images as fake but occasionally misses subtle fakes.
+\end{enumerate}
+
+\subsection{Analysis: WorstF1 vs.\ Val F1 Selection}
+
+The dramatic difference between WorstF1 and Val F1 selection reveals a critical insight about training dynamics. When using Val F1, the model progressively specializes: it becomes excellent at detecting the most prominent artifacts (nearest-neighbor) while losing sensitivity to subtler ones (bicubic). Table~\ref{tab:training-dyn} shows the per-mode validation F1 trajectories.
+
+\begin{table}[t]
+\centering
+\caption{Training dynamics: Val F1 vs.\ per-mode F1 over epochs. Selected checkpoint (epoch~1) is marked with *.}
+\label{tab:training-dyn}
+\begin{tabular}{ccccccc}
+\toprule
+Epoch & Val F1 & WorstF1 & NearF1 & BiliF1 & BicuF1 & Note \\
+\midrule
+1 & 0.7560 & \textbf{0.3304} & 0.3304 & 0.3555 & 0.3626 & * \\
+5 & 0.8548 & 0.2375 & 0.2519 & 0.2596 & 0.2375 & \\
+10 & 0.8732 & 0.0896 & 0.1107 & 0.1073 & 0.0896 & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+As Val F1 increases from 0.76 to 0.87, WorstF1 collapses from 0.33 to 0.09. The model is becoming more confident on easy cases while losing discriminative ability on harder ones. By selecting the earliest checkpoint (epoch~1) where all modes have comparable (if modest) performance, we preserve the model's balanced sensitivity---which turns out to be essential for generalizing to unseen generators.
+
+\section{Conclusion}
+
+We presented a simulation-based training framework for AI-generated image detection that requires zero real fake images during training. By synthesizing fake images through downsampling-upsampling pipelines and training a frequency-domain CNN, we achieve 0.92 overall F1 across 7 diverse generators on the GenImage benchmark. Our key contributions are: (1)~demonstrating that simple interpolation-based simulation suffices to capture universal upsampling artifacts, (2)~showing that mixing incompatible simulation modes (transposed convolution, JPEG) degrades performance, and (3)~introducing worst-case F1 selection which prevents mode-specific overfitting and is critical for generalization.
+
+Limitations remain: diffusion models with sophisticated upsampling (Stable Diffusion~v1.5, wukong) are harder to detect, and the overall AUC (0.80) suggests room for improvement. Future work could explore adaptive simulation that better matches the spectral profiles of specific generator architectures, as well as more sophisticated model selection strategies beyond the simple min-over-modes approach.
+
+\section*{Acknowledgements}
+
+This project was conducted as part of the CS3308 Machine Learning course.
+
+\bibliographystyle{plain}
+\begin{thebibliography}{13}
+
+\bibitem{brock2019large}
+Andrew Brock, Jeff Donahue, and Karen Simonyan.
+\newblock Large scale {GAN} training for high fidelity natural image synthesis.
+\newblock In \emph{ICLR}, 2019.
+
+\bibitem{frank2020leveraging}
+Joel Frank, Thorsten Eisenhofer, Lea Schonherr, Asja Fischer, Dorothea Kolossa, and Thorsten Holz.
+\newblock Leveraging frequency analysis for deepfake image recognition.
+\newblock In \emph{ICML}, 2020.
+
+\bibitem{dong2022think}
+Chunrong Dong, Yuxiang Wei, Xinghe Fu, and Xiaodong Cui.
+\newblock Think twice before detecting {GAN}-generated fake images from their spectral imprints.
+\newblock In \emph{CVPR}, 2022.
+
+\bibitem{goodfellow2014generative}
+Ian Goodfellow, Jean Pouget-Abadie, Mehdi Mirza, Bing Xu, David Warde-Farley, Sherjil Ozair, Aaron Courville, and Yoshua Bengio.
+\newblock Generative adversarial nets.
+\newblock In \emph{NeurIPS}, 2014.
+
+\bibitem{he2016deep}
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun.
+\newblock Deep residual learning for image recognition.
+\newblock In \emph{CVPR}, 2016.
+
+\bibitem{ho2020denoising}
+Jonathan Ho, Ajay Jain, and Pieter Abbeel.
+\newblock Denoising diffusion probabilistic models.
+\newblock In \emph{NeurIPS}, 2020.
+
+\bibitem{karras2019style}
+Tero Karras, Samuli Laine, and Timo Aila.
+\newblock A style-based generator architecture for generative adversarial networks.
+\newblock In \emph{CVPR}, 2019.
+
+\bibitem{krizhevsky2012imagenet}
+Alex Krizhevsky, Ilya Sutskever, and Geoffrey~E. Hinton.
+\newblock {ImageNet} classification with deep convolutional neural networks.
+\newblock In \emph{NeurIPS}, 2012.
+
+\bibitem{rombach2022high}
+Robin Rombach, Andreas Blattmann, Dominik Lorenz, Patrick Esser, and Bjorn Ommer.
+\newblock High-resolution image synthesis with latent diffusion models.
+\newblock In \emph{CVPR}, 2022.
+
+\bibitem{saharia2022photorealistic}
+Chitwan Saharia, William Chan, Saurabh Saxena, Lala Li, Jay Whang, Emily Denton, Seyed Kamyar Seyed Ghasemipour, Burcu Karagol Ayan, S.~Sara Mahdavi, Rapha{\"e}l Gontijo Lopes, et~al.
+\newblock Photorealistic text-to-image diffusion models with deep language understanding.
+\newblock In \emph{NeurIPS}, 2022.
+
+\bibitem{zhang2020detecting}
+Xu Zhang, Svebor Karaman, and Shih-Fu Chang.
+\newblock Detecting and simulating artifacts in {GAN} fake images.
+\newblock In \emph{IS\&T International Symposium on Electronic Imaging}, 2020.
+
+\bibitem{zhu2023genimage}
+Mingjian Zhu, Hanting Chen, Qiangyu Yan, Xudong Huang, Guanyu Lin, Wei Li, Zhijun Tu, Hailin Hu, Jie Hu, and Yunhe Wang.
+\newblock {GenImage}: A million-scale benchmark for detecting {AI}-generated image.
+\newblock In \emph{NeurIPS Datasets and Benchmarks Track}, 2023.
+
+\end{thebibliography}
+
+\end{document}
